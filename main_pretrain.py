@@ -22,6 +22,7 @@ setproctitle.setproctitle('TuckER_pretrain@zzl')
 
 device = torch.device('cuda')
 
+
 class Experiment:
     def __init__(self, lr, edim, batch_size, dr):
         self.lr = lr
@@ -65,7 +66,8 @@ class Experiment:
             losses = []
             np.random.shuffle(er_vocab_pairs)
             for j in tqdm(range(0, len(er_vocab_pairs), self.batch_size)):
-                data_batch, targets = self.get_batch(er_vocab, er_vocab_pairs, j)
+                data_batch, targets = self.get_batch(
+                    er_vocab, er_vocab_pairs, j)
                 h_idx = data_batch[:, 0]
                 r_idx = data_batch[:, 1]
                 predictions = model.forward(h_idx, r_idx)
@@ -76,40 +78,58 @@ class Experiment:
                 losses.append(loss.item())
             if self.dr:
                 scheduler.step()
-            print('\nEpoch=%d, train time cost %.4fs, loss:%.8f' % (it, time.time() - start_train, np.mean(losses)))
+            print('\nEpoch=%d, train time cost %.4fs, loss:%.8f' %
+                  (it, time.time() - start_train, np.mean(losses)))
             loss_epoch.append(np.mean(losses))
-            mlflow.log_metrics({'train_time': time.time()-start_train, 'loss': loss_epoch[-1], 'current_it': it}, step=it)
+            mlflow.log_metrics({'train_time': time.time(
+            )-start_train, 'loss': loss_epoch[-1], 'current_it': it}, step=it)
 
-        E_save=model.E.weight
+        E_save = model.E.weight
         np.savez(archive_path + 'ER.npz',
-                E_pretrain=E_save.detach().cpu().numpy())
+                 E_pretrain=E_save.detach().cpu().numpy())
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_iterations", type=int, default=200, nargs="?", help="Number of iterations.")
-    parser.add_argument("--batch_size", type=int, default=1024, nargs="?", help="Batch size.")
-    parser.add_argument("--lr", type=float, default=0.003, nargs="?", help="Learning rate.")
-    parser.add_argument("--dr", type=float, default=0.995, nargs="?", help="Decay rate.")
-    parser.add_argument("--edim", type=int, default=64, nargs="?", help="Entity embedding dimensionality.")
-    parser.add_argument("--dropout_h1", type=float, default=0.2, nargs="?", help="Dropout rate.")
-    parser.add_argument("--dropout_h2", type=float, default=0.3, nargs="?", help="Dropout rate.")
-    parser.add_argument("--dropout_in", type=float, default=0.3, nargs="?", help="Dropout rate.")
+    parser.add_argument("--num_iterations", type=int,
+                        default=200, nargs="?", help="Number of iterations.")
+    parser.add_argument("--batch_size", type=int,
+                        default=1024, nargs="?", help="Batch size.")
+    parser.add_argument("--lr", type=float, default=0.003,
+                        nargs="?", help="Learning rate.")
+    parser.add_argument("--dr", type=float, default=0.995,
+                        nargs="?", help="Decay rate.")
+    parser.add_argument("--edim", type=int, default=64,
+                        nargs="?", help="Entity embedding dimensionality.")
+    parser.add_argument("--dropout_h1", type=float,
+                        default=0.2, nargs="?", help="Dropout rate.")
+    parser.add_argument("--dropout_h2", type=float,
+                        default=0.3, nargs="?", help="Dropout rate.")
+    parser.add_argument("--dropout_in", type=float,
+                        default=0.3, nargs="?", help="Dropout rate.")
 
     parser.add_argument("--exp_name", type=str, default="pretrain")
-    parser.add_argument("--patience", type=int, default=50, nargs="?", help="valid patience.")
-    parser.add_argument("--seed", type=int, default=20, nargs="?", help="random seed.")
+    parser.add_argument("--patience", type=int, default=50,
+                        nargs="?", help="valid patience.")
+    parser.add_argument("--seed", type=int, default=20,
+                        nargs="?", help="random seed.")
     parser.add_argument("--model_name", type=str, default="TuckER")
     parser.add_argument("--loss", type=str, default="CE")
 
-    parser.add_argument("--dataset", type=str, default='nyc', nargs="?", help="")
+    parser.add_argument("--dataset", type=str,
+                        default='nyc', nargs="?", help="")
 
     args = parser.parse_args()
     print(args)
 
     data_dir = "./data/data_{}/".format(args.dataset)
-    archive_path = './data/data_{}/'.format(args.dataset)
-    
+
+    # 根据数据集设置输出路径
+    if args.dataset == 'HK':
+        archive_path = './data/data_{}/HK_regions/'.format(args.dataset)
+    else:
+        archive_path = './data/data_{}/'.format(args.dataset)
+
     assert os.path.exists(data_dir)
     if not os.path.exists(archive_path):
         os.makedirs(archive_path)
@@ -127,7 +147,7 @@ if __name__ == '__main__':
         EXP_ID = experiments.experiment_id
         print('Experiment Exists, Continuing')
     with mlflow.start_run(experiment_id=EXP_ID) as current_run:
-        
+
         # ~~~~~~~~~~~~~~~~~ reproduce setting ~~~~~~~~~~~~~~~~~~~~~
         seed = args.seed
         np.random.seed(seed)
@@ -139,10 +159,10 @@ if __name__ == '__main__':
         torch.backends.cudnn.deterministic = True
 
         print('Loading data....')
-        d = Data(data_dir=data_dir)
+        d = Data(data_dir=data_dir, dataset_name=args.dataset)
         params = vars(args)
         mlflow.log_params(params)
- 
-        experiment = Experiment(batch_size=args.batch_size, lr=args.lr, dr=args.dr, edim=args.edim)
-        experiment.train_and_eval()
 
+        experiment = Experiment(
+            batch_size=args.batch_size, lr=args.lr, dr=args.dr, edim=args.edim)
+        experiment.train_and_eval()
