@@ -137,7 +137,7 @@ if __name__ == '__main__':
     # ~~~~~~~~~~~~~~~~~~ mlflow experiment ~~~~~~~~~~~~~~~~~~~~~
 
     experiment_name = 'TuckER_pretrain'
-    mlflow.set_tracking_uri('/data1/zhouzhilun/flow_generation/mlflow_output/')
+    mlflow.set_tracking_uri('./mlflow_output/')
     client = MlflowClient()
     try:
         EXP_ID = client.create_experiment(experiment_name)
