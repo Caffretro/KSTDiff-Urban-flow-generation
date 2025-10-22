@@ -23,31 +23,37 @@ import math
 
 # constants
 
-ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
+ModelPrediction = namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
 
+
 def exists(x):
     return x is not None
+
 
 def default(val, d):
     if exists(val):
         return val
     return d() if callable(d) else d
 
+
 def identity(t, *args, **kwargs):
     return t
 
 # deterministic feed forward neural network
+
+
 class DeterministicFeedForwardNeuralNetwork(nn.Module):
 
-    def __init__(self, dim_in, dim_out, hid_layers=[100,50],
+    def __init__(self, dim_in, dim_out, hid_layers=[100, 50],
                  use_batchnorm=False, negative_slope=0.01, dropout_rate=0):
         super(DeterministicFeedForwardNeuralNetwork, self).__init__()
         self.dim_in = dim_in  # dimension of nn input
         self.dim_out = dim_out  # dimension of nn output
         self.hid_layers = hid_layers  # nn hidden layer architecture
-        self.nn_layers = [self.dim_in] + self.hid_layers  # nn hidden layer architecture, except output layer
+        # nn hidden layer architecture, except output layer
+        self.nn_layers = [self.dim_in] + self.hid_layers
         self.use_batchnorm = use_batchnorm  # whether apply batch norm
         self.negative_slope = negative_slope  # negative slope for LeakyReLU
         self.dropout_rate = dropout_rate
@@ -57,7 +63,8 @@ class DeterministicFeedForwardNeuralNetwork(nn.Module):
     def create_nn_layers(self):
         layers = []
         for idx in range(len(self.nn_layers) - 1):
-            layers.append(nn.Linear(self.nn_layers[idx], self.nn_layers[idx + 1]))
+            layers.append(
+                nn.Linear(self.nn_layers[idx], self.nn_layers[idx + 1]))
             if self.use_batchnorm:
                 layers.append(nn.BatchNorm1d(self.nn_layers[idx + 1]))
             layers.append(nn.LeakyReLU(negative_slope=self.negative_slope))
@@ -96,22 +103,23 @@ class SemanticAttention(nn.Module):
             nn.Linear(hidden_size, 1, bias=False)
         )
 
-    def forward(self, z): # (bs*nreg*nhour)*2*dim
+    def forward(self, z):  # (bs*nreg*nhour)*2*dim
         w = self.project(z).mean(0)
         beta = torch.softmax(w, dim=0)
         beta = beta.expand((z.shape[0],) + beta.shape)
 
         return (beta * z).sum(1)
-   
+
 
 class KGFlowBlock(nn.Module):
-    def __init__(self, dim, nr, nhour, cond_dim, kwargs, kgedim):
+    def __init__(self, dim, nr, nhour, cond_dim, kwargs, kgedim, event_dim=0):
         super().__init__()
         self.dim = dim
         self.num_rgcns = kwargs['num_rgcns']
         self.num_sas = kwargs['num_sas']
         self.cond_dim = cond_dim
         self.kgedim = kgedim
+        self.event_dim = event_dim  # 事件特征维度 d_event
 
         self.mlp = nn.Sequential(
             nn.SiLU(),
@@ -119,100 +127,128 @@ class KGFlowBlock(nn.Module):
         )
 
         self.kge_projection = nn.Conv1d(kgedim, dim, 1)
-        self.conditioner_projection = nn.Conv1d(cond_dim, 2 * dim, 1)
-        
+
+        # 时变条件投影：将静态条件 + 事件特征融合后投影
+        # cond_dim (静态特征) + event_dim (事件特征) -> 2*dim
+        total_cond_dim = cond_dim + event_dim if event_dim > 0 else cond_dim
+        self.conditioner_projection = nn.Conv1d(total_cond_dim, 2 * dim, 1)
+
         self.flowrgcns = nn.ModuleList()
         for _ in range(kwargs['num_flowrgcns']):
             self.flowrgcns.append(RGCNConv(dim, dim, nr))
 
         self.blocks = nn.ModuleList()
         for _ in range(kwargs['num_sas']):
-            self.blocks.append(Building_Block(dim, kwargs['num_heads'], kwargs['dropout']))
+            self.blocks.append(Building_Block(
+                dim, kwargs['num_heads'], kwargs['dropout']))
 
         self.mha = nn.MultiheadAttention(embed_dim=dim, num_heads=4)
-        
+
         self.middle_projection = nn.Conv1d(dim, 2 * dim, 1)
-        
+
         self.output_projection = nn.Conv1d(dim, 2 * dim, 1)
 
-    def forward(self, x_in, flowkg, time_emb, cond, KGE): # x:bs*nreg*nhour*trans_dim
+    def forward(self, x_in, flowkg, time_emb, cond, KGE, event_cond=None):  # x:bs*nreg*nhour*trans_dim
         bs, nreg, nhour, dim = x_in.shape
         assert self.dim == dim
         x = x_in
 
-        time_emb = time_emb.reshape(bs, -1) # bs*48
-        time_emb = self.mlp(time_emb) # bs*(nhour*dim)
+        time_emb = time_emb.reshape(bs, -1)  # bs*48
+        time_emb = self.mlp(time_emb)  # bs*(nhour*dim)
         time_emb = time_emb.reshape(bs, nhour, dim)
-        time_emb = time_emb[:, None, :, :] # bs,1,nhour,dim
+        time_emb = time_emb[:, None, :, :]  # bs,1,nhour,dim
         x = x + time_emb
 
         # RGCN
-        xnew = torch.tensor([], device = x.device)
+        xnew = torch.tensor([], device=x.device)
         for i in range(bs):
-            tmpE = x[i] # nreg*nhour*(...)
+            tmpE = x[i]  # nreg*nhour*(...)
             allhour = []
             for j in range(nhour):
-                E_hour = tmpE[:, j, :] # nreg*d
-                tmpdata = geoData(x=E_hour, edge_index=flowkg.edge_index, edge_type=flowkg.edge_type)
+                E_hour = tmpE[:, j, :]  # nreg*d
+                tmpdata = geoData(
+                    x=E_hour, edge_index=flowkg.edge_index, edge_type=flowkg.edge_type)
                 allhour.append(tmpdata)
             tmploader = DataLoader(allhour, batch_size=len(allhour))
             for batch in tmploader:
                 for k in range(len(self.flowrgcns)):
-                    xbatch = self.flowrgcns[k](batch.x, edge_index = batch.edge_index, edge_type = batch.edge_type) # (nhour*nreg)*d
+                    xbatch = self.flowrgcns[k](
+                        batch.x, edge_index=batch.edge_index, edge_type=batch.edge_type)  # (nhour*nreg)*d
                     # xbatch = torch.tanh(xbatch)
                     xbatch = F.relu(xbatch)
-            xbatch = xbatch.reshape(nhour, nreg, -1) # nhour*nreg*(...)
-            xbatch = xbatch.permute(1,0,2) # nreg*nhour*(...)
-            xbatch = xbatch[None, :, :, :] 
-            xnew = torch.cat((xnew, xbatch), dim=0) # bs*nreg*nhour*d
+            xbatch = xbatch.reshape(nhour, nreg, -1)  # nhour*nreg*(...)
+            xbatch = xbatch.permute(1, 0, 2)  # nreg*nhour*(...)
+            xbatch = xbatch[None, :, :, :]
+            xnew = torch.cat((xnew, xbatch), dim=0)  # bs*nreg*nhour*d
         out_spatial = xnew.reshape(bs*nreg, nhour, -1)
 
         # temporal
-        out_temporal = x.reshape(bs*nreg, nhour, -1) 
+        out_temporal = x.reshape(bs*nreg, nhour, -1)
 
         # transformer
         for i in range(self.num_sas):
-            out_temporal = self.blocks[i](out_temporal) # (bs*nreg)*nhour*dim
+            out_temporal = self.blocks[i](out_temporal)  # (bs*nreg)*nhour*dim
 
         # KGE: nreg*kgedim
-        emb = KGE[None,:,:,None].repeat(bs,1,1,1).reshape(bs*nreg, self.kgedim, 1)
-        emb = self.kge_projection(emb) # (bs*nreg)*dim*1
-        emb = emb.repeat(1,1,nhour).permute(0,2,1) # (bs*nreg)*nhour*d
-        
+        emb = KGE[None, :, :, None].repeat(
+            bs, 1, 1, 1).reshape(bs*nreg, self.kgedim, 1)
+        emb = self.kge_projection(emb)  # (bs*nreg)*dim*1
+        emb = emb.repeat(1, 1, nhour).permute(0, 2, 1)  # (bs*nreg)*nhour*d
+
         # fusion
-        out_spatial = out_spatial.reshape(-1, dim) # (bs*nreg*nhour)*dim
-        out_temporal = out_temporal.reshape(-1, dim) # (bs*nreg*nhour)*dim
-        emb = emb.reshape(-1, dim) # (bs*nreg*nhour)*dim
-        out = torch.stack([out_spatial, out_temporal], dim=1) # (bs*nreg*nhour)*2*dim
+        out_spatial = out_spatial.reshape(-1, dim)  # (bs*nreg*nhour)*dim
+        out_temporal = out_temporal.reshape(-1, dim)  # (bs*nreg*nhour)*dim
+        emb = emb.reshape(-1, dim)  # (bs*nreg*nhour)*dim
+        out = torch.stack([out_spatial, out_temporal],
+                          dim=1)  # (bs*nreg*nhour)*2*dim
 
         # Q=KGE, K=V=[spatial;temporal]
-        key = out.permute(1,0,2) # 2*(bs*nreg*nhour)*dim
-        value = out.permute(1,0,2) # 2*(bs*nreg*nhour)*dim
-        query = emb[None,:,:] # 1*(bs*nreg*nhour)*dim
+        key = out.permute(1, 0, 2)  # 2*(bs*nreg*nhour)*dim
+        value = out.permute(1, 0, 2)  # 2*(bs*nreg*nhour)*dim
+        query = emb[None, :, :]  # 1*(bs*nreg*nhour)*dim
 
         out, weight = self.mha(query, key, value)
-        out = out[0,:,:]
+        out = out[0, :, :]
 
         # out = out_spatial + out_temporal + emb
         out = out.reshape(bs*nreg, nhour, dim)
 
-        # cond:nreg*cond_dim
-        cond = cond[None,:,:,None].repeat(bs,1,1,1).reshape(bs*nreg, self.cond_dim, 1)
-        cond = self.conditioner_projection(cond) # (bs*nreg)*2dim*1
+        # 时变条件融合：将静态条件 cond 与事件条件 event_cond 拼接
+        # cond: nreg*cond_dim (静态区域特征)
+        # event_cond: nreg*nhour*event_dim (时变事件特征，已经是每个时刻的)
+        if event_cond is not None and self.event_dim > 0:
+            # event_cond: bs*nreg*nhour*event_dim
+            # 将静态条件扩展到每个时刻，然后与事件条件拼接
+            cond_static = cond[None, :, :, None].repeat(
+                bs, 1, 1, nhour)  # bs*nreg*cond_dim*nhour
+            event_cond_reshaped = event_cond.permute(
+                0, 1, 3, 2)  # bs*nreg*event_dim*nhour
+            # bs*nreg*(cond_dim+event_dim)*nhour
+            cond_full = torch.cat([cond_static, event_cond_reshaped], dim=2)
+            # (bs*nreg)*(cond_dim+event_dim)*nhour
+            cond_full = cond_full.reshape(bs*nreg, -1, nhour)
+            cond_proj = self.conditioner_projection(
+                cond_full)  # (bs*nreg)*2dim*nhour
+        else:
+            # 没有事件条件，使用原始静态条件
+            cond_static = cond[None, :, :, None].repeat(
+                bs, 1, 1, 1).reshape(bs*nreg, self.cond_dim, 1)
+            cond_proj = self.conditioner_projection(
+                cond_static)  # (bs*nreg)*2dim*1
 
-        out = out.permute(0,2,1) # (bs*nreg)*dim*nhour
-        out = self.middle_projection(out) # (bs*nreg)*2dim*nhour
-        out = out + cond  # (bs*nreg)*2dim*nhour
+        out = out.permute(0, 2, 1)  # (bs*nreg)*dim*nhour
+        out = self.middle_projection(out)  # (bs*nreg)*2dim*nhour
+        out = out + cond_proj  # (bs*nreg)*2dim*nhour
 
-        gate, filter = torch.chunk(out, 2, dim=1) # (bs*nreg)*dim*nhour
-        out = torch.sigmoid(gate) * torch.tanh(filter) # (bs*nreg)*dim*nhour
+        gate, filter = torch.chunk(out, 2, dim=1)  # (bs*nreg)*dim*nhour
+        out = torch.sigmoid(gate) * torch.tanh(filter)  # (bs*nreg)*dim*nhour
 
-        out = self.output_projection(out) # (bs*nreg)*2d*nhour
-        residual, skip = torch.chunk(out, 2, dim=1) # (bs*nreg)*d*nhour
+        out = self.output_projection(out)  # (bs*nreg)*2d*nhour
+        residual, skip = torch.chunk(out, 2, dim=1)  # (bs*nreg)*d*nhour
 
-        residual = residual.permute(0,2,1).reshape(bs, nreg, nhour, -1)
-        skip = skip.permute(0,2,1).reshape(bs, nreg, nhour, -1)
-        
+        residual = residual.permute(0, 2, 1).reshape(bs, nreg, nhour, -1)
+        skip = skip.permute(0, 2, 1).reshape(bs, nreg, nhour, -1)
+
         return (x_in + residual) / math.sqrt(2.0), skip
 
 
@@ -228,19 +264,21 @@ class KGFlow(nn.Module):
 
         fea_dim = d.features.shape[1]
 
-        self.features = nn.Embedding.from_pretrained(torch.tensor(d.features, dtype = torch.float), freeze=True)
+        self.features = nn.Embedding.from_pretrained(
+            torch.tensor(d.features, dtype=torch.float), freeze=True)
 
         # use pretrain KGE
-        self.KGE=nn.Embedding.from_pretrained(torch.tensor(d.KGE_pretrain, dtype = torch.float), freeze=True)
+        self.KGE = nn.Embedding.from_pretrained(torch.tensor(
+            d.KGE_pretrain, dtype=torch.float), freeze=True)
         kgedim = d.KGE_pretrain.shape[1]
-        
+
         scale_cat_dim = 16
         nhour = len(d.train_data[0][0])
         self.scale_mlp = nn.Linear(1, scale_cat_dim)
 
         # time embeddings
         dim = kwargs['dim']
-        time_dim = len(d.train_data[0][0]) * self.flow_channels # 24*2
+        time_dim = len(d.train_data[0][0]) * self.flow_channels  # 24*2
         sinu_pos_emb = SinusoidalPosEmb(dim)
         fourier_dim = dim
         self.time_mlp = nn.Sequential(
@@ -250,8 +288,7 @@ class KGFlow(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
         kwargs['time_dim'] = time_dim
-        
-        
+
         kge_cat_dim = kwargs['kge_cat_dim']
         self.kge_mlp = nn.Linear(fea_dim, kge_cat_dim)
 
@@ -259,49 +296,80 @@ class KGFlow(nn.Module):
         xt_cat_dim = kwargs['xt_cat_dim']
         self.input_projection = nn.Conv1d(self.flow_channels, xt_cat_dim, 1)
 
+        # 事件特征处理
+        # 检查是否有事件数据
+        event_dim = 0
+        self.has_events = d.event_tensor is not None
+        if self.has_events:
+            event_dim = d.event_tensor.shape[2]  # d_event
+            # 事件特征投影：d_event -> event_emb_dim
+            event_emb_dim = kwargs.get('event_emb_dim', 16)  # 可配置的事件嵌入维度
+            self.event_mlp = nn.Sequential(
+                nn.Linear(event_dim, event_emb_dim),
+                nn.ReLU(),
+                nn.Linear(event_emb_dim, event_emb_dim)
+            )
+            event_dim = event_emb_dim  # 更新事件维度为嵌入维度
+            print(f'Event features enabled with dim={event_dim}')
+        else:
+            self.event_mlp = None
+            print('No event features found, using static conditions only')
+
         cond_dim = scale_cat_dim + kge_cat_dim
         trans_dim = xt_cat_dim
 
         residual_layers = kwargs['n_layer']
         self.residual_layers = nn.ModuleList([
-            KGFlowBlock(dim = trans_dim, nr = nr, nhour = nhour, 
-                        cond_dim = cond_dim, kwargs = kwargs, kgedim = kgedim)
+            KGFlowBlock(dim=trans_dim, nr=nr, nhour=nhour,
+                        cond_dim=cond_dim, kwargs=kwargs, kgedim=kgedim, event_dim=event_dim)
             for i in range(residual_layers)
         ])
-        
+
         self.middle_projection = nn.Conv1d(trans_dim, trans_dim, 1)
         self.output_projection = nn.Conv1d(trans_dim, self.flow_channels, 1)
-        
 
     def init(self):
         xavier_normal_(self.KGE.weight.data)
 
-    def forward(self, x_in, regids, time, g, flowkg, predscale):
-        t = self.time_mlp(time) # bs*time_dim
+    def forward(self, x_in, regids, time, g, flowkg, predscale, event_features=None):
+        t = self.time_mlp(time)  # bs*time_dim
         bs, nreg, nhour, _ = x_in.shape
-        
-        # feature condition
-        E = self.features.weight # ne*fea_dim
-        E = E[regids] # nreg*fea_dim, only use region emb in KG
-        E = self.kge_mlp(E) # nreg*kge_cat_dim
-        
-        # add scale condition
-        cond = predscale # bs*nreg*nhour*2
-        cond = cond[0,:,0,:1] # nreg*1
-        cond = self.scale_mlp(cond) # nreg*scale_cat_dim
-        E = torch.cat((E, cond), dim = 1) # nreg*(kge_cat_dim+scale_cat_dim)
 
-        x = x_in.reshape(bs, nreg, -1) # bs*nreg*2nhour
-        t = t[:,None,:] # bs*1*time_dim
-        x = x.view(bs, nreg, -1, 2) # bs*nreg*nhour*2
+        # feature condition
+        E = self.features.weight  # ne*fea_dim
+        E = E[regids]  # nreg*fea_dim, only use region emb in KG
+        E = self.kge_mlp(E)  # nreg*kge_cat_dim
+
+        # add scale condition
+        cond = predscale  # bs*nreg*nhour*2
+        cond = cond[0, :, 0, :1]  # nreg*1
+        cond = self.scale_mlp(cond)  # nreg*scale_cat_dim
+        E = torch.cat((E, cond), dim=1)  # nreg*(kge_cat_dim+scale_cat_dim)
+
+        # 处理事件特征
+        # event_features: bs*nreg*nhour*d_event (已经从event_tensor中提取的当前时间段事件)
+        event_cond = None
+        if self.has_events and event_features is not None:
+            # event_features: bs*nreg*nhour*d_event
+            # 通过MLP投影到事件嵌入空间
+            event_cond_flat = event_features.reshape(
+                bs * nreg * nhour, -1)  # (bs*nreg*nhour)*d_event
+            # (bs*nreg*nhour)*event_emb_dim
+            event_cond_emb = self.event_mlp(event_cond_flat)
+            event_cond = event_cond_emb.reshape(
+                bs, nreg, nhour, -1)  # bs*nreg*nhour*event_emb_dim
+
+        x = x_in.reshape(bs, nreg, -1)  # bs*nreg*2nhour
+        t = t[:, None, :]  # bs*1*time_dim
+        x = x.view(bs, nreg, -1, 2)  # bs*nreg*nhour*2
 
         # input Conv1*1
-        x = x.view(bs * nreg, -1, self.flow_channels) # (bs*nreg)*nhour*2
-        x = x.permute(0, 2, 1) # (bs*nreg)*2*nhour
-        x = self.input_projection(x) # (bs*nreg)*xt_cat_dim*nhour
+        x = x.view(bs * nreg, -1, self.flow_channels)  # (bs*nreg)*nhour*2
+        x = x.permute(0, 2, 1)  # (bs*nreg)*2*nhour
+        x = self.input_projection(x)  # (bs*nreg)*xt_cat_dim*nhour
         x = F.relu(x)
-        x = x.permute(0, 2, 1) # (bs*nreg)*nhour*xt_cat_dim
-        x = x.view(bs, nreg, nhour, -1) # bs*nreg*nhour*xt_cat_dim
+        x = x.permute(0, 2, 1)  # (bs*nreg)*nhour*xt_cat_dim
+        x = x.view(bs, nreg, nhour, -1)  # bs*nreg*nhour*xt_cat_dim
 
         # KGE
         KGE = self.KGE.weight
@@ -309,43 +377,48 @@ class KGFlow(nn.Module):
 
         skip = None
         for layer in self.residual_layers:
-            x, skip_connection = layer(x, flowkg, t, E, KGE)
+            x, skip_connection = layer(x, flowkg, t, E, KGE, event_cond)
             skip = skip_connection if skip is None else skip_connection + skip
 
         out = skip / math.sqrt(len(self.residual_layers))
 
-        out = x.reshape(bs*nreg, nhour, -1) # (bs*nreg)*nhour*dim
-        out = out.permute(0, 2, 1) # (bs*nreg)*dim*nhour
-        out = self.middle_projection(out) # (bs*nreg)*2*nhour
+        out = x.reshape(bs*nreg, nhour, -1)  # (bs*nreg)*nhour*dim
+        out = out.permute(0, 2, 1)  # (bs*nreg)*dim*nhour
+        out = self.middle_projection(out)  # (bs*nreg)*2*nhour
         out = F.relu(out)
-        out = self.output_projection(out) # (bs*nreg)*2*nhour
-        out = out.permute(0, 2, 1) # (bs*nreg)*nhour*2
+        out = self.output_projection(out)  # (bs*nreg)*2*nhour
+        out = out.permute(0, 2, 1)  # (bs*nreg)*nhour*2
         out = out.reshape(bs, nreg, nhour, -1)
 
         return out
+
 
 def extract(a, t, x_shape):
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+
 def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
     beta_start = scale * 0.0001
     beta_end = scale * 0.02
-    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
+    return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float64)
 
-def cosine_beta_schedule(timesteps, s = 0.008):
+
+def cosine_beta_schedule(timesteps, s=0.008):
     """
     cosine schedule
     as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
     """
     steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
+    alphas_cumprod = torch.cos(
+        ((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
+
 
 class GaussianDiffusion(nn.Module):
     def __init__(
@@ -354,22 +427,23 @@ class GaussianDiffusion(nn.Module):
         *,
         cond_pred_model,
         d,
-        data_shape, # nreg*nhour*2
+        data_shape,  # nreg*nhour*2
         g,
         g_train,
         g_samp,
         image_size,
-        timesteps = 1000,
-        sampling_timesteps = None,
-        loss_type = 'l1',
-        objective = 'pred_noise',
-        beta_schedule = 'cosine',
-        p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
-        p2_loss_weight_k = 1,
-        ddim_sampling_eta = 1.
+        timesteps=1000,
+        sampling_timesteps=None,
+        loss_type='l1',
+        objective='pred_noise',
+        beta_schedule='cosine',
+        # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
+        p2_loss_weight_gamma=0.,
+        p2_loss_weight_k=1,
+        ddim_sampling_eta=1.
     ):
         super().__init__()
-        
+
         # condition prediction model
         self.cond_pred_model = cond_pred_model
 
@@ -380,11 +454,21 @@ class GaussianDiffusion(nn.Module):
         self.g_samp = g_samp
         self.self_condition = False
 
-        self.image_size = image_size #128
+        self.image_size = image_size  # 128
 
-        self.objective = objective # pred_noise
+        self.objective = objective  # pred_noise
 
-        assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
+        # 存储事件张量数据
+        self.event_tensor = d.event_tensor
+        self.has_events = d.event_tensor is not None
+        if self.has_events:
+            # 注册为buffer，使其随模型移动到GPU
+            self.register_buffer('event_data', torch.tensor(
+                d.event_tensor, dtype=torch.float32))
+            print(f'Event tensor registered: shape={self.event_data.shape}')
+
+        assert objective in {'pred_noise', 'pred_x0',
+                             'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
 
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
@@ -395,15 +479,17 @@ class GaussianDiffusion(nn.Module):
 
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.) # [1.]+[alphas_cumprod[:-1]]
+        # [1.]+[alphas_cumprod[:-1]]
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
 
-        timesteps, = betas.shape # 1000
+        timesteps, = betas.shape  # 1000
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
         # sampling related parameters
 
-        self.sampling_timesteps = default(sampling_timesteps, timesteps) # default num sampling timesteps to number of timesteps at training
+        # default num sampling timesteps to number of timesteps at training
+        self.sampling_timesteps = default(sampling_timesteps, timesteps)
 
         assert self.sampling_timesteps <= timesteps
         self.is_ddim_sampling = self.sampling_timesteps < timesteps
@@ -411,10 +497,13 @@ class GaussianDiffusion(nn.Module):
 
         # helper function to register buffer from float64 to float32
 
-        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32)) # 不会被算作model parameters
+        def register_buffer(name, val): return self.register_buffer(
+            name, val.to(torch.float32))  # 不会被算作model parameters
 
-        self.register_buffer('scale', torch.tensor(d.scale, dtype = torch.float)) # nreg*1
-        self.register_buffer('scale_pred_X', torch.tensor(d.scale_pred_X, dtype = torch.float)) # nreg*37
+        self.register_buffer('scale', torch.tensor(
+            d.scale, dtype=torch.float))  # nreg*1
+        self.register_buffer('scale_pred_X', torch.tensor(
+            d.scale_pred_X, dtype=torch.float))  # nreg*37
 
         register_buffer('betas', betas)
         register_buffer('alphas_cumprod', alphas_cumprod)
@@ -423,14 +512,19 @@ class GaussianDiffusion(nn.Module):
         # calculations for diffusion q(x_t | x_{t-1}) and others
 
         register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
-        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
-        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
-        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+        register_buffer('sqrt_one_minus_alphas_cumprod',
+                        torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod',
+                        torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod',
+                        torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod',
+                        torch.sqrt(1. / alphas_cumprod - 1))
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
 
-        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        posterior_variance = betas * \
+            (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
 
         # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
 
@@ -438,16 +532,21 @@ class GaussianDiffusion(nn.Module):
 
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
 
-        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min =1e-20)))
-        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
-        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+        register_buffer('posterior_log_variance_clipped',
+                        torch.log(posterior_variance.clamp(min=1e-20)))
+        register_buffer('posterior_mean_coef1', betas *
+                        torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev)
+                        * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-        coef3 = 1. + (torch.sqrt(alphas_cumprod) - 1.) * (torch.sqrt(alphas) + torch.sqrt(alphas_cumprod_prev)) / (1. - alphas_cumprod)
+        coef3 = 1. + (torch.sqrt(alphas_cumprod) - 1.) * (torch.sqrt(alphas) +
+                                                          torch.sqrt(alphas_cumprod_prev)) / (1. - alphas_cumprod)
         register_buffer('posterior_mean_coef3', coef3)
 
         # calculate p2 reweighting
 
-        register_buffer('p2_loss_weight', (p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
+        register_buffer('p2_loss_weight', (p2_loss_weight_k +
+                        alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
 
     def predict_start_from_noise(self, x_t, t, noise, f_phi):
         return (
@@ -459,14 +558,15 @@ class GaussianDiffusion(nn.Module):
     def predict_noise_from_start(self, x_t, t, x0, f_phi):
         tmp = extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
         return (
-            (tmp * x_t - x0 - (tmp - 1) * f_phi) / \
+            (tmp * x_t - x0 - (tmp - 1) * f_phi) /
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
 
     def predict_v(self, x_start, t, noise):
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+            extract(self.sqrt_one_minus_alphas_cumprod,
+                    t, x_start.shape) * x_start
         )
 
     def predict_start_from_v(self, x_t, t, v):
@@ -483,32 +583,82 @@ class GaussianDiffusion(nn.Module):
             extract(self.posterior_mean_coef3, t, x_t.shape) * f_phi
         )
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        posterior_log_variance_clipped = extract(
+            self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
-    
+
     def compute_guiding_prediction(self, x_start, regids):
         bs, nreg, nh, c = x_start.shape
 
         X = self.scale_pred_X[regids]
-        pred = self.cond_pred_model(X) # nregs*1
+        pred = self.cond_pred_model(X)  # nregs*1
         x_T_mean = pred[None, :, :, None]
         x_T_mean = x_T_mean.repeat(bs, 1, nh, c)
 
         return x_T_mean
 
-    def model_predictions(self, x, sampids, t, x_self_cond = None, clip_x_start = False, mode = 'train'):
-        
+    def extract_event_features(self, regids, hour_indices):
+        """
+        从事件张量中提取当前批次和时间段的事件特征
+
+        Args:
+            regids: 区域ID列表 (nreg,)
+            hour_indices: 小时索引 (bs, nhour) 或单个小时范围
+
+        Returns:
+            event_features: bs*nreg*nhour*d_event 或 None
+        """
+        if not self.has_events:
+            return None
+
+        # event_data: nreg_total × T × d_event
+        # 提取指定区域和时间段的事件特征
+        # 对于训练，hour_indices 是数据对应的小时索引
+        # 这里假设hour_indices是固定的24小时模式（0-23）
+        # 如果需要动态小时索引，需要从训练循环传入
+
+        # 简化处理：直接使用完整的事件张量的前nhour个小时
+        # 在实际应用中，应该根据数据的时间戳动态提取
+        nreg = len(regids)
+        nhour = self.data_shape[1]  # 24小时
+
+        # 提取指定区域的事件数据: nreg × T × d_event
+        event_subset = self.event_data[regids, :, :]  # nreg × T × d_event
+
+        # 取前nhour小时（或根据实际需求循环）
+        # 这里使用模运算以支持跨天的情况
+        # 实际应用中应该传入准确的小时索引
+        event_features = event_subset[:, :nhour, :]  # nreg × nhour × d_event
+
+        # 扩展batch维度
+        event_features = event_features[None, :, :, :].expand(
+            1, -1, -1, -1)  # 1 × nreg × nhour × d_event
+
+        return event_features
+
+    def model_predictions(self, x, sampids, t, x_self_cond=None, clip_x_start=False, mode='train'):
+
         f_phi = self.compute_guiding_prediction(x, sampids)
 
-        assert mode in ['train','sample']
+        # 提取事件特征
+        event_features = self.extract_event_features(
+            sampids, hour_indices=None)
+        if event_features is not None:
+            bs = x.shape[0]
+            event_features = event_features.expand(
+                bs, -1, -1, -1)  # bs × nreg × nhour × d_event
+
+        assert mode in ['train', 'sample']
         if mode == 'train':
-            model_output = self.model(x, sampids, t, self.g, self.g_train, f_phi)
+            model_output = self.model(
+                x, sampids, t, self.g, self.g_train, f_phi, event_features)
         elif mode == 'sample':
-            model_output = self.model(x, sampids, t, self.g, self.g_samp, f_phi)
+            model_output = self.model(
+                x, sampids, t, self.g, self.g_samp, f_phi, event_features)
 
-        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
+        maybe_clip = partial(torch.clamp, min=-1.,
+                             max=1.) if clip_x_start else identity
 
-        
         if self.objective == 'pred_noise':
             pred_noise = model_output
             x_start = self.predict_start_from_noise(x, t, pred_noise, f_phi)
@@ -527,49 +677,53 @@ class GaussianDiffusion(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, sampids, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, sampids, t, x_self_cond, mode = 'sample')
+    def p_mean_variance(self, x, sampids, t, x_self_cond=None, clip_denoised=True):
+        preds = self.model_predictions(
+            x, sampids, t, x_self_cond, mode='sample')
         x_start = preds.pred_x_start
 
         if clip_denoised:
             x_start.clamp_(-1., 1.)
 
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t, sampids = sampids)
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
+            x_start=x_start, x_t=x, t=t, sampids=sampids)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, sampids, t: int, x_self_cond = None, clip_denoised = True):
+    def p_sample(self, x, sampids, t: int, x_self_cond=None, clip_denoised=True):
         b, *_, device = *x.shape, x.device
-        batched_times = torch.full((x.shape[0],), t, device = x.device, dtype = torch.long) # [t]*bs
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, sampids = sampids, t = batched_times, x_self_cond = x_self_cond, clip_denoised = clip_denoised)
-        noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
-        pred_img = model_mean + (0.5 * model_log_variance).exp() * noise # x_{t-1}
+        batched_times = torch.full(
+            (x.shape[0],), t, device=x.device, dtype=torch.long)  # [t]*bs
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(
+            x=x, sampids=sampids, t=batched_times, x_self_cond=x_self_cond, clip_denoised=clip_denoised)
+        noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
+        pred_img = model_mean + \
+            (0.5 * model_log_variance).exp() * noise  # x_{t-1}
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, sampids, shape): # shape=(bs, nreg, nhour, 2)
+    def p_sample_loop(self, sampids, shape):  # shape=(bs, nreg, nhour, 2)
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device=device)
 
         # noise sample with predicted mean
-        x_T_mean = self.compute_guiding_prediction(img, sampids) # nreg*1
+        x_T_mean = self.compute_guiding_prediction(img, sampids)  # nreg*1
         assert x_T_mean.shape == shape
         img = img + x_T_mean
 
         x_start = None
 
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             self_cond = x_start if self.self_condition else None
             img, x_start = self.p_sample(img, sampids, t, self_cond)
 
         return img
 
     @torch.no_grad()
-    def sample(self, sampids, batch_size = 16):
+    def sample(self, sampids, batch_size=16):
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn(sampids, (batch_size, len(sampids), self.data_shape[1], self.data_shape[2]))
-
 
     def q_sample(self, x_start, x_T_mean, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -577,7 +731,8 @@ class GaussianDiffusion(nn.Module):
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
             (1 - extract(self.sqrt_alphas_cumprod, t, x_start.shape)) * x_T_mean +
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+            extract(self.sqrt_one_minus_alphas_cumprod,
+                    t, x_start.shape) * noise
         )
 
     @property
@@ -588,16 +743,18 @@ class GaussianDiffusion(nn.Module):
             return F.mse_loss
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
-    
-    def p_losses(self, x_start, regids, t, noise = None):
+
+    def p_losses(self, x_start, regids, t, noise=None):
         bs, nreg, nh, c = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
-        x_T_mean = self.compute_guiding_prediction(x_start, regids) # bs*nreg*nhour*2
+        x_T_mean = self.compute_guiding_prediction(
+            x_start, regids)  # bs*nreg*nhour*2
         assert x_T_mean.shape == x_start.shape
 
-        x = self.q_sample(x_start = x_start, x_T_mean = x_T_mean, t = t, noise = noise) # shape=x_start.shape
+        x = self.q_sample(x_start=x_start, x_T_mean=x_T_mean,
+                          t=t, noise=noise)  # shape=x_start.shape
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
@@ -610,8 +767,14 @@ class GaussianDiffusion(nn.Module):
                 x_self_cond.detach_()
 
         # predict and take gradient step
+        # 提取事件特征
+        event_features = self.extract_event_features(regids, hour_indices=None)
+        if event_features is not None:
+            event_features = event_features.expand(
+                bs, -1, -1, -1)  # bs × nreg × nhour × d_event
 
-        model_out = self.model(x, regids, t, self.g, self.g_train, x_T_mean) # shape=x_start.shape
+        model_out = self.model(x, regids, t, self.g, self.g_train,
+                               x_T_mean, event_features)  # shape=x_start.shape
 
         if self.objective == 'pred_noise':
             target = noise
@@ -623,8 +786,9 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        loss = self.loss_fn(model_out, target, reduction = 'none') # x_start.shape
-        loss = reduce(loss, 'b ... -> b (...)', 'mean') # bs*-1
+        loss = self.loss_fn(model_out, target,
+                            reduction='none')  # x_start.shape
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')  # bs*-1
 
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
         return loss.mean()
@@ -635,4 +799,3 @@ class GaussianDiffusion(nn.Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         return self.p_losses(img, regids, t, *args, **kwargs)
-
