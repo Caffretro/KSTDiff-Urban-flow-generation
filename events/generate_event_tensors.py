@@ -3,7 +3,7 @@
 将三类2019年事件（站点停运、演唱会、极端天气）转换为与模型输入对齐的时空事件张量
 
 时间维度：按小时对齐，一年按 24×365 = 8760 小时索引
-空间维度：MTR Voronoi 区域索引（103个区域）
+空间维度：MTR Voronoi 区域索引（95个区域）
 事件通道：
   - service_outage: 区域是否受停运影响（0/1）
   - concert: 是否发生演唱会（0/1）
@@ -17,6 +17,7 @@ import geopandas as gpd
 from datetime import datetime, timedelta
 from shapely.geometry import Point
 from pathlib import Path
+import re
 
 # 定义路径
 BASE_DIR = Path(__file__).parent.parent
@@ -30,13 +31,13 @@ OUTPUT_FILE = EVENTS_DIR / "hk_events_2019.npz"
 # 2019年参数
 YEAR = 2019
 NUM_HOURS = 24 * 365  # 8760小时
-NUM_REGIONS = 103  # MTR站点/Voronoi区域数量
+NUM_REGIONS = 95  # MTR站点/Voronoi区域数量
 
 
 def load_station_mapping():
     """加载MTR站点中英文名称和Station Code映射"""
-    # 读取MTR网络数据
-    mtr_df = pd.read_csv(REGIONS_DIR / "MTR_Service_Network.csv")
+    # 读取MTR站点数据
+    mtr_df = pd.read_csv(REGIONS_DIR / "mtr_unique_stations.csv")
 
     # 创建中文名到Station Code的映射
     station_map = {}
@@ -46,6 +47,7 @@ def load_station_mapping():
         if chinese_name not in station_map:
             station_map[chinese_name] = station_code
 
+    print(f"Loaded {len(station_map)} station mappings")
     return station_map
 
 
@@ -111,7 +113,7 @@ def process_service_outage(station_map, code_to_idx):
     处理站点停运事件
 
     Returns:
-        service_outage_tensor: (8760, 103) 二值张量
+        service_outage_tensor: (8760, 95) 二值张量
     """
     print("Processing service outage events...")
 
@@ -119,6 +121,9 @@ def process_service_outage(station_map, code_to_idx):
 
     # 读取停运数据
     outage_df = pd.read_csv(EVENTS_DIR / "mtr_events.txt")
+
+    processed_count = 0
+    skipped_count = 0
 
     for _, row in outage_df.iterrows():
         station_name = row['station']
@@ -128,14 +133,15 @@ def process_service_outage(station_map, code_to_idx):
         # 获取Station Code
         if station_name not in station_map:
             print(f"Warning: Station '{station_name}' not found in mapping")
+            skipped_count += 1
             continue
 
         station_code = station_map[station_name]
 
         # 获取区域索引
         if station_code not in code_to_idx:
-            print(
-                f"Warning: Station code '{station_code}' not found in Voronoi regions")
+            print(f"Warning: Station code '{station_code}' not found in Voronoi regions")
+            skipped_count += 1
             continue
 
         region_idx = code_to_idx[station_code]
@@ -150,9 +156,10 @@ def process_service_outage(station_map, code_to_idx):
 
         # 填充张量（包含end_hour这一小时）
         tensor[start_hour:end_hour + 1, region_idx] = 1.0
+        processed_count += 1
 
-    print(
-        f"Service outage events: {np.sum(tensor > 0)} hour-region pairs affected")
+    print(f"Service outage events: {processed_count} events processed, {skipped_count} skipped")
+    print(f"Service outage events: {np.sum(tensor > 0)} hour-region pairs affected")
     return tensor
 
 
@@ -161,7 +168,7 @@ def process_concerts(gdf):
     处理演唱会事件
 
     Returns:
-        concert_tensor: (8760, 103) 二值张量
+        concert_tensor: (8760, 95) 二值张量
     """
     print("Processing concert events...")
 
@@ -170,6 +177,9 @@ def process_concerts(gdf):
     # 读取演唱会数据
     concerts_df = pd.read_csv(
         EVENTS_DIR / "Hong_Kong_Concerts_2019_Final_processed.csv")
+
+    processed_count = 0
+    skipped_count = 0
 
     for _, row in concerts_df.iterrows():
         try:
@@ -180,13 +190,26 @@ def process_concerts(gdf):
 
             # 处理时间格式（可能包含pm/am标记）
             # 示例: "2019-01-01 15:00pm" 或 "2019-01-01 3:00pm"
+            # 或者 "25/07/2019 (Thur) 19:15"
             dt_str = show_datetime.replace('pm', '').replace('am', '').strip()
+            
+            # 处理 "DD/MM/YYYY (Day) HH:MM" 格式
+            if '/' in dt_str and '(' in dt_str:
+                # 提取日期时间部分，去掉星期几
+                match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})\s+\([^)]+\)\s+(\d{1,2}:\d{2})', dt_str)
+                if match:
+                    date_part = match.group(1)
+                    time_part = match.group(2)
+                    # 转换为标准格式
+                    dt_obj = datetime.strptime(f"{date_part} {time_part}", "%d/%m/%Y %H:%M")
+                    dt_str = dt_obj.strftime("%Y-%m-%d %H:%M")
 
             # 获取小时索引
             hour_idx = datetime_to_hour_index(dt_str)
 
             # 确保索引在有效范围内
             if hour_idx < 0 or hour_idx >= NUM_HOURS:
+                skipped_count += 1
                 continue
 
             # 查找所属Voronoi区域
@@ -204,11 +227,16 @@ def process_concerts(gdf):
                 end_hour = min(end_hour, NUM_HOURS - 1)
 
                 tensor[hour_idx:end_hour + 1, region_idx] = 1.0
+                processed_count += 1
+            else:
+                skipped_count += 1
 
         except Exception as e:
             print(f"Error processing concert: {e}, row: {row}")
+            skipped_count += 1
             continue
 
+    print(f"Concert events: {processed_count} events processed, {skipped_count} skipped")
     print(f"Concert events: {np.sum(tensor > 0)} hour-region pairs affected")
     return tensor
 
@@ -224,7 +252,7 @@ def process_weather_events():
     - 3: 高档（其他所有警告）
 
     Returns:
-        weather_tensor: (8760, 103) 标量张量（全域影响）
+        weather_tensor: (8760, 95) 标量张量（全域影响）
     """
     print("Processing extreme weather events...")
 
@@ -329,7 +357,7 @@ def main():
         concert=concert_tensor,
         extreme_weather=weather_tensor,
         description="HK 2019 Event Tensors: service_outage (binary), concert (binary), extreme_weather (0/1/2/3)",
-        shape_info="(8760 hours, 103 regions)",
+        shape_info="(8760 hours, 95 regions)",
         year=YEAR
     )
 

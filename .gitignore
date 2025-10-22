@@ -1,2 +1,4 @@
 **/.DS_Store
 .cursor/
+**/__pycache__/
+**/mlflow_output/
